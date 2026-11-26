@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+# kp — KeePassXC + git-синхронизация (Linux)
+#
+#   kp open     получить изменения из git, открыть базу, после выхода запушить
+#   kp sync     закоммитить изменения и запушить (вызывается таймером)
+#   kp merge    слить расходящиеся версии базы
+#   kp status   показать состояние синхронизации
+#
+# Настройки через переменные окружения:
+#   KP_VAULT_DIR (по умолчанию ~/Vault), KP_DB_NAME (passwords.kdbx),
+#   KP_BRANCH (main), KP_REMOTE (origin), KPXC, KPXC_CLI, KP_NO_NOTIFY, KP_PASSWORD
+
+set -uo pipefail
+
+VAULT_DIR="${KP_VAULT_DIR:-$HOME/Vault}"
+DB_NAME="${KP_DB_NAME:-passwords.kdbx}"
+BRANCH="${KP_BRANCH:-main}"
+REMOTE="${KP_REMOTE:-origin}"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}"
+LOCK_FILE="$CACHE_DIR/keepass-sync.lock"
+DB="$VAULT_DIR/$DB_NAME"
+CONFLICTS="$VAULT_DIR/conflicts"
+HOST="$(hostname -s 2>/dev/null || echo host)"
+KPXC="${KPXC:-keepassxc}"
+KPXC_CLI="${KPXC_CLI:-keepassxc-cli}"
+
+log() { printf '%s\n' "$*" >&2; }
+die() { log "kp: $*"; exit 1; }
+
+notify() {
+  local msg="$*"
+  log "$msg"
+  [ -n "${KP_NO_NOTIFY:-}" ] && return 0
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a "KeePass sync" -i keepassxc "KeePass" "$msg" >/dev/null 2>&1 || true
+  fi
+}
+
+ask_password() {
+  if [ -n "${KP_PASSWORD:-}" ]; then
+    printf '%s' "$KP_PASSWORD"
+    return 0
+  fi
+  if command -v kdialog >/dev/null 2>&1 && [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
+    kdialog --title "KeePass" --password "Мастер-пароль базы:" 2>/dev/null
+  else
+    local pw=""
+    read -rsp "Мастер-пароль базы: " pw || return 1
+    printf '\n' >&2
+    printf '%s' "$pw"
+  fi
+}
+
+take_lock() {
+  mkdir -p "$CACHE_DIR" || die "не могу создать $CACHE_DIR"
+  exec 9>"$LOCK_FILE" || die "не могу открыть lock-файл"
+  if ! flock -n 9; then
+    log "синхронизация уже выполняется — пропускаю"
+    return 1
+  fi
+  return 0
+}
+
+release_lock() { flock -u 9 2>/dev/null || true; }
+
+in_repo() {
+  [ -d "$VAULT_DIR/.git" ] || die "нет git-репозитория в $VAULT_DIR"
+  cd "$VAULT_DIR" || die "не могу перейти в $VAULT_DIR"
+}
+
+have_commits()    { git rev-parse --verify -q HEAD >/dev/null 2>&1; }
+have_remote_ref() { git rev-parse --verify -q "refs/remotes/$REMOTE/$BRANCH" >/dev/null 2>&1; }
+app_running()     { pgrep -x keepassxc >/dev/null 2>&1; }
+db_exists()       { [ -f "$DB" ] && [ -s "$DB" ]; }
+
+is_kdbx() {
+  [ -f "$1" ] || return 1
+  local m
+  m="$(od -An -tx1 -N4 -- "$1" 2>/dev/null | tr -d ' \n')"
+  [ "$m" = "03d9a29a" ]
+}
+
+db_dirty() {
+  [ -f "$DB" ] || return 1
+  [ -n "$(git status --porcelain -- "$DB_NAME" 2>/dev/null)" ]
+}
+
+# Заполняет AHEAD и BEHIND относительно origin/$BRANCH
+diverged_info() {
+  AHEAD=0
+  BEHIND=0
+  have_commits && have_remote_ref || return 0
+  BEHIND="$(git rev-list --count "HEAD..$REMOTE/$BRANCH" 2>/dev/null || echo 0)"
+  AHEAD="$(git rev-list --count "$REMOTE/$BRANCH..HEAD" 2>/dev/null || echo 0)"
+}
+
+fetch_remote() {
+  git fetch --prune "$REMOTE" >/dev/null 2>&1
+}
+
+commit_db() {
+  db_exists || return 0
+  if ! is_kdbx "$DB"; then
+    notify "Файл $DB_NAME не похож на KDBX — коммит пропущен"
+    return 1
+  fi
+  if db_dirty; then
+    git add -- "$DB_NAME" || return 1
+    git commit -q -m "sync($HOST): $(date '+%Y-%m-%d %H:%M:%S')" || return 1
+    log "коммит: $(git log -1 --format='%h %s')"
+  fi
+  return 0
+}
+
+push_db() {
+  have_commits || return 0
+  if git push -q "$REMOTE" "HEAD:$BRANCH" 2>/dev/null; then
+    log "push: успешно"
+    return 0
+  fi
+  notify "не удалось запушить в git — проверьте сеть/доступ"
+  return 1
+}
+
+ff_pull() {
+  if app_running; then
+    log "KeePassXC запущен — pull отложен"
+    return 1
+  fi
+  if git merge --ff-only -q "$REMOTE/$BRANCH" >/dev/null 2>&1; then
+    notify "база обновлена с другого устройства"
+    return 0
+  fi
+  return 1
+}
+
+# Слияние расходящихся версий: remote-копия сохраняется, записи объединяются
+merge_db() {
+  in_repo
+  fetch_remote || { notify "нет связи с git — слияние невозможно"; return 1; }
+  diverged_info
+  if [ "$AHEAD" -eq 0 ] && [ "$BEHIND" -eq 0 ]; then
+    log "сливать нечего: локальная и удалённая версии совпадают"
+    return 0
+  fi
+  app_running && { notify "закройте KeePassXC перед слиянием"; return 1; }
+  db_exists || { notify "локальной базы нет — сделайте 'kp open' для первичной загрузки"; return 1; }
+
+  commit_db || return 1
+  fetch_remote || true
+  diverged_info
+
+  if [ "$BEHIND" -eq 0 ]; then
+    push_db
+    return $?
+  fi
+
+  mkdir -p "$CONFLICTS" || die "не могу создать $CONFLICTS"
+  local ts remote_copy local_copy pw
+  ts="$(date +%Y%m%d-%H%M%S)"
+  remote_copy="$CONFLICTS/remote-$HOST-$ts.kdbx"
+  local_copy="$CONFLICTS/local-$HOST-$ts.kdbx"
+
+  git show "$REMOTE/$BRANCH:$DB_NAME" >"$remote_copy" 2>/dev/null || {
+    notify "не удалось прочитать версию из git"
+    return 1
+  }
+  cp -f "$DB" "$local_copy"
+
+  pw="$(ask_password)" || true
+  if [ -z "$pw" ]; then
+    notify "слияние отменено: пароль не введён. Копии: $remote_copy"
+    return 1
+  fi
+
+  if ! printf '%s\n' "$pw" | "$KPXC_CLI" merge --pw-stdin "$DB" "$remote_copy" \
+      >"$CONFLICTS/merge.log" 2>&1; then
+    notify "автослияние не удалось. Откройте базу и выполните Database → Merge from database → $remote_copy"
+    log "--- merge.log ---"
+    sed -n '1,20p' "$CONFLICTS/merge.log" >&2
+    return 1
+  fi
+  unset pw
+
+  commit_db || true
+
+  # Свести историю: merge-коммит поверх origin, содержимое — слитая локальная база
+  if ! git merge --ff-only -q "$REMOTE/$BRANCH" >/dev/null 2>&1; then
+    git merge --no-commit --no-ff "$REMOTE/$BRANCH" >/dev/null 2>&1
+    git checkout --ours -- "$DB_NAME" >/dev/null 2>&1
+    git add -- "$DB_NAME"
+    git commit -q -m "merge($HOST): $(date '+%Y-%m-%d %H:%M:%S')" >/dev/null 2>&1 \
+      || git commit -q --no-edit >/dev/null 2>&1
+  fi
+
+  push_db
+  notify "слияние завершено. Проверьте записи и удалите $remote_copy и $local_copy"
+}
+
+cmd_open() {
+  take_lock || exit 0
+  in_repo
+  fetch_remote || log "нет связи с git — открываю локальную версию"
+
+  if db_exists; then
+    commit_db || true
+    diverged_info
+    if [ "$AHEAD" -gt 0 ] && [ "$BEHIND" -gt 0 ]; then
+      notify "версии разошлись — выполняю слияние"
+      release_lock
+      merge_db || log "слияние отложено, открываю локальную базу"
+    elif [ "$BEHIND" -gt 0 ]; then
+      ff_pull || true
+    fi
+  fi
+
+  release_lock
+
+  if db_exists; then
+    "$KPXC" "$DB" >/dev/null 2>&1 || true
+  else
+    log "базы ещё нет: создайте её в KeePassXC по пути $DB"
+    "$KPXC" >/dev/null 2>&1 || true
+  fi
+
+  take_lock || exit 0
+  in_repo
+  commit_db || true
+  diverged_info
+  if [ "$AHEAD" -gt 0 ] && [ "$BEHIND" -gt 0 ]; then
+    notify "появились изменения с другого устройства — выполните 'kp merge'"
+  else
+    push_db
+  fi
+  release_lock
+}
+
+cmd_sync() {
+  take_lock || exit 0
+  in_repo
+  if ! db_exists; then
+    log "базы ещё нет: $DB"
+    release_lock
+    return 0
+  fi
+  fetch_remote || log "нет связи с git — работаю локально"
+  commit_db || true
+  diverged_info
+
+  if app_running; then
+    push_db
+    [ "$BEHIND" -gt 0 ] && notify "в git есть изменения с другого устройства — после закрытия KeePassXC выполните 'kp merge'"
+    release_lock
+    return 0
+  fi
+
+  if [ "$AHEAD" -gt 0 ] && [ "$BEHIND" -gt 0 ]; then
+    push_db
+    notify "версии разошлись — выполните 'kp merge'"
+    release_lock
+    return 0
+  fi
+
+  if [ "$BEHIND" -gt 0 ] && [ "$AHEAD" -eq 0 ]; then
+    ff_pull || true
+  fi
+  push_db
+  release_lock
+}
+
+cmd_status() {
+  in_repo
+  echo "репозиторий : $VAULT_DIR"
+  echo "база        : $DB $([ -f "$DB" ] && echo "(есть)" || echo "(нет)")"
+  echo "ветка       : $BRANCH (remote: $REMOTE)"
+  echo "KeePassXC   : $(app_running && echo запущен || echo закрыт)"
+  fetch_remote || echo "git         : нет связи с remote"
+
+  if have_commits; then
+    echo "HEAD        : $(git log -1 --format='%h %s (%cr)')"
+  else
+    echo "HEAD        : коммитов нет"
+  fi
+
+  diverged_info
+  echo "ahead/behind: $AHEAD / $BEHIND"
+  if db_dirty; then
+    echo "изменения   : есть незакоммиченные правки $DB_NAME"
+  else
+    echo "изменения   : нет"
+  fi
+  if [ -d "$CONFLICTS" ] && [ -n "$(ls -A "$CONFLICTS" 2>/dev/null)" ]; then
+    echo "конфликты   : $(ls -1 "$CONFLICTS")"
+  fi
+}
+
+usage() {
+  cat <<EOF
+kp — KeePassXC + git
+
+  kp open     pull (если безопасно) → открыть базу → commit+push после выхода
+  kp sync     commit+push; безопасный pull, если база закрыта
+  kp merge    слить локальную и удалённую версии базы
+  kp status   состояние синхронизации
+
+Переменные: KP_VAULT_DIR, KP_DB_NAME, KP_BRANCH, KP_REMOTE, KP_NO_NOTIFY, KP_PASSWORD
+EOF
+}
+
+case "${1:-}" in
+  open)   cmd_open ;;
+  sync)   cmd_sync ;;
+  merge)  merge_db ;;
+  status) cmd_status ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac

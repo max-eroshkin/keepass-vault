@@ -1,0 +1,13 @@
+# Служебные файлы KeePassXC
+*.kdbx.lock
+*.kdbx.old
+*.kdbx.bak
+*.kdbx.bak.*
+*.kdbx.tmp
+*.tmp
+
+# Конфликтные копии (содержат копию базы — только локально)
+conflicts/
+
+# Мусор синхронизации
+.kp-*
