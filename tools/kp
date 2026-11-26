@@ -173,11 +173,12 @@ merge_db() {
     return 1
   fi
 
-  if ! printf '%s\n' "$pw" | "$KPXC_CLI" merge --pw-stdin "$DB" "$remote_copy" \
-      >"$CONFLICTS/merge.log" 2>&1; then
+  # keepassxc-cli 2.8 не умеет принимать пароль из stdin: используем pty через script.
+  # Вывод подавляем, чтобы пароль не попал в лог.
+  local merge_cmd
+  merge_cmd="$KPXC_CLI merge -s $(printf '%q' "$DB") $(printf '%q' "$remote_copy")"
+  if ! printf '%s\n' "$pw" | script -qec "$merge_cmd" /dev/null >/dev/null 2>&1; then
     notify "автослияние не удалось. Откройте базу и выполните Database → Merge from database → $remote_copy"
-    log "--- merge.log ---"
-    sed -n '1,20p' "$CONFLICTS/merge.log" >&2
     return 1
   fi
   unset pw
